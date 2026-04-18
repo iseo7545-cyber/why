@@ -2,7 +2,7 @@
 # =============================================================================
 #  Gentoo Linux Professional Installation Script (Solidified Version)
 #  Target: /dev/nvme0n1 | Root: p4 | Boot: p6
-#  Design: High Stability, Zero-Manual Intervention, Security Hardened
+#  Design: Offline Stage3 Loading, High Stability, Security Hardened
 # =============================================================================
 
 set -Eeuo pipefail
@@ -14,8 +14,6 @@ readonly ROOT_PART="${DISK}p4"
 readonly EFI_PART="${DISK}p6"
 readonly MOUNT_POINT="/mnt/gentoo"
 readonly ARCH="amd64"
-readonly MIRROR="https://distfiles.gentoo.org"
-readonly STAGE3_VARIANT="desktop-openrc"
 
 # --- Visuals ---
 RED='\033[0;31m'
@@ -47,13 +45,11 @@ trap 'log_fatal "Interrupted by user."' INT TERM
 
 # --- Hardware Detection ---
 get_optimal_jobs() {
-    local nproc
+    local nproc mem_total mem_jobs final_jobs
     nproc=$(nproc)
-    # Ensure we don't exceed RAM capacity (approx 2GB per job for heavy compiles)
-    local mem_total
     mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-    local mem_jobs=$(( mem_total / 2048000 ))
-    local final_jobs=$(( nproc < mem_jobs ? nproc : mem_jobs ))
+    mem_jobs=$(( mem_total / 2048000 ))
+    final_jobs=$(( nproc < mem_jobs ? nproc : mem_jobs ))
     if (( final_jobs < 1 )); then final_jobs=1; fi
     echo "$final_jobs"
 }
@@ -65,7 +61,6 @@ check_env() {
     [[ -b "$DISK" ]] || log_fatal "Disk $DISK not found."
     [[ -d /sys/firmware/efi/efivars ]] || log_fatal "Not in UEFI mode."
     
-    # Check if partitions exist
     lsblk "$ROOT_PART" >/dev/null 2>&1 || log_fatal "Root partition $ROOT_PART does not exist."
     lsblk "$EFI_PART" >/dev/null 2>&1 || log_fatal "EFI partition $EFI_PART does not exist."
     
@@ -74,8 +69,6 @@ check_env() {
 
 prepare_disk() {
     log_step "Preparing Partitions"
-    
-    # Deactivate any active swaps or mounts
     swapoff -a || true
     umount -l "$ROOT_PART" 2>/dev/null || true
     umount -l "$EFI_PART" 2>/dev/null || true
@@ -87,7 +80,7 @@ prepare_disk() {
     mkfs.ext4 -F -L "GENTOO_ROOT" "$ROOT_PART"
     
     sync && partprobe "$DISK"
-    sleep 2 # Let kernel settle
+    sleep 2
 }
 
 mount_system() {
@@ -99,29 +92,40 @@ mount_system() {
     log_info "Mounting complete."
 }
 
-fetch_stage3() {
-    log_step "Deploying Stage3"
+deploy_stage3() {
+    log_step "Handling Pre-downloaded Stage3"
+    
+    # 현재 디렉토리에서 가장 최신 stage3 tarball 찾기
+    local local_stage3
+    local_stage3=$(ls stage3-amd64-desktop-openrc-*.tar.xz 2>/dev/null | sort -V | tail -n1 || true)
+    
+    if [[ -z "$local_stage3" ]]; then
+        echo -e "${YELLOW}Stage3 파일이 없습니다!${NC}"
+        echo -e "1. https://www.gentoo.org/downloads/mirrors/ 사이트에 접속하세요."
+        echo -e "2. 가까운 미러를 선택해 releases/amd64/autobuilds/ 경로로 들어갑니다."
+        echo -e "3. stage3-amd64-desktop-openrc-XXXXXXXXXXXXXX.tar.xz 파일을 다운로드하세요."
+        echo -e "4. 다운로드한 파일을 이 스크립트(${0##*/})와 같은 폴더에 넣고 다시 실행하세요."
+        log_fatal "Stage3 tarball missing in current directory."
+    fi
+
+    log_info "Found Stage3: $local_stage3"
+    log_info "Copying to mount point..."
+    cp "$local_stage3" "$MOUNT_POINT/"
+    
     cd "$MOUNT_POINT"
+    log_info "Extracting Stage3..."
+    tar xpf "$local_stage3" --xattrs-include='*.*' --numeric-owner
     
-    local latest_path
-    latest_path=$(wget -qO- "${MIRROR}/releases/${ARCH}/autobuilds/latest-stage3-amd64-${STAGE3_VARIANT}.txt" | grep -v "^#" | cut -f1 -d" " | head -n1)
-    [[ -z "$latest_path" ]] && log_fatal "Failed to resolve Stage3 path."
-    
-    log_info "Downloading: $latest_path"
-    wget -c "${MIRROR}/releases/${ARCH}/autobuilds/${latest_path}"
-    
-    log_info "Extracting..."
-    tar xpf "$(basename "$latest_path")" --xattrs-include='*.*' --numeric-owner
-    rm -f "$(basename "$latest_path")"
+    log_info "Cleaning up temporary tarball..."
+    rm -f "$local_stage3"
+    cd - >/dev/null
 }
 
 configure_base() {
     log_step "Configuring Base System"
-    
     local jobs
     jobs=$(get_optimal_jobs)
     
-    # Optimized make.conf
     cat > "${MOUNT_POINT}/etc/portage/make.conf" <<EOF
 COMMON_FLAGS="-O2 -pipe -march=native"
 CFLAGS="\${COMMON_FLAGS}"
@@ -129,16 +133,13 @@ CXXFLAGS="\${COMMON_FLAGS}"
 MAKEOPTS="-j${jobs}"
 EMERGE_DEFAULT_OPTS="--with-bdeps=y --binpkg-respect-use=y --getbinpkg=y --autounmask-write=n --jobs=${jobs} --load-average=${jobs}"
 ACCEPT_LICENSE="*"
-GENTOO_MIRRORS="${MIRROR}"
 USE="unicode nls efi elogind dbus policykit pipewire wayland plasma"
 VIDEO_CARDS="intel amdgpu radeonsi nvidia"
 GRUB_PLATFORMS="efi-64"
 EOF
 
-    # Copy DNS
     cp --dereference /etc/resolv.conf "${MOUNT_POINT}/etc/resolv.conf"
     
-    # Mount kernel filesystems
     for dev in /proc /sys /dev /run; do
         mount --rbind "$dev" "${MOUNT_POINT}${dev}"
         mount --make-rslave "${MOUNT_POINT}${dev}"
@@ -147,12 +148,10 @@ EOF
 
 run_chroot_install() {
     log_step "Entering Chroot for Finalization"
-    
     local root_uuid efi_uuid
     root_uuid=$(blkid -s UUID -o value "$ROOT_PART")
     efi_uuid=$(blkid -s UUID -o value "$EFI_PART")
 
-    # We use a heredoc to avoid leaking secrets into the script file
     cat > "${MOUNT_POINT}/tmp/install.sh" <<EOF
 #!/bin/bash
 source /etc/profile
@@ -211,7 +210,7 @@ main() {
     check_env
     prepare_disk
     mount_system
-    fetch_stage3
+    deploy_stage3
     configure_base
     run_chroot_install
     
